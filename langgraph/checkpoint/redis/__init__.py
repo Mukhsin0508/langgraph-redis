@@ -29,7 +29,6 @@ from ulid import ULID
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.checkpoint.redis.ashallow import AsyncShallowRedisSaver
 from langgraph.checkpoint.redis.base import (
-    CHECKPOINT_BLOB_PREFIX,
     CHECKPOINT_PREFIX,
     CHECKPOINT_WRITE_PREFIX,
     REDIS_KEY_SEPARATOR,
@@ -55,7 +54,11 @@ logger = logging.getLogger(__name__)
 
 
 class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
-    """Standard Redis implementation for checkpoint saving."""
+    """Standard Redis implementation for checkpoint saving.
+
+    Supports standard Redis URLs (redis://), SSL (rediss://), and
+    Sentinel URLs (redis+sentinel://host:26379/service_name/db).
+    """
 
     _redis: Union[Redis, RedisCluster]  # Support both standalone and cluster clients
     # Whether to assume the Redis server is a cluster; None triggers auto-detection
@@ -69,7 +72,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         connection_args: Optional[Dict[str, Any]] = None,
         ttl: Optional[Dict[str, Any]] = None,
         checkpoint_prefix: str = CHECKPOINT_PREFIX,
-        checkpoint_blob_prefix: str = CHECKPOINT_BLOB_PREFIX,
         checkpoint_write_prefix: str = CHECKPOINT_WRITE_PREFIX,
     ) -> None:
         super().__init__(
@@ -78,7 +80,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             connection_args=connection_args,
             ttl=ttl,
             checkpoint_prefix=checkpoint_prefix,
-            checkpoint_blob_prefix=checkpoint_blob_prefix,
             checkpoint_write_prefix=checkpoint_write_prefix,
         )
         # Prefixes are now set in BaseRedisSaver.__init__
@@ -97,7 +98,11 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         redis_client: Optional[Union[Redis, RedisCluster]] = None,
         connection_args: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Configure the Redis client."""
+        """Configure the Redis client.
+
+        Supports standard Redis URLs (redis://), SSL (rediss://), and
+        Sentinel URLs (redis+sentinel://host:26379/service_name/db).
+        """
         from redis.exceptions import ResponseError
 
         from langgraph.checkpoint.redis.version import __full_lib_name__
@@ -121,9 +126,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
     def create_indexes(self) -> None:
         self.checkpoints_index = SearchIndex.from_dict(
             self.checkpoints_schema, redis_client=self._redis
-        )
-        self.checkpoint_blobs_index = SearchIndex.from_dict(
-            self.blobs_schema, redis_client=self._redis
         )
         self.checkpoint_writes_index = SearchIndex.from_dict(
             self.writes_schema, redis_client=self._redis
@@ -480,7 +482,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        """Store a checkpoint to Redis with separate blob storage."""
+        """Store a checkpoint to Redis with inline channel value storage."""
         configurable = config["configurable"].copy()
 
         run_id = configurable.pop("run_id", metadata.get("run_id"))
@@ -975,12 +977,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             # TTL states: -2 = key doesn't exist, -1 = key exists but no TTL, 0 = expired, >0 = seconds remaining
             if current_ttl > 0:
                 # Note: We don't refresh TTL for keys with no expiry (TTL = -1)
-                # Get all blob keys related to this checkpoint
-                from langgraph.checkpoint.redis.base import (
-                    CHECKPOINT_BLOB_PREFIX,
-                    CHECKPOINT_WRITE_PREFIX,
-                )
-
                 # Get write keys - use key registry if available, otherwise fall back to search
                 write_keys = []
 
@@ -1132,7 +1128,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         connection_args: Optional[Dict[str, Any]] = None,
         ttl: Optional[Dict[str, Any]] = None,
         checkpoint_prefix: str = CHECKPOINT_PREFIX,
-        checkpoint_blob_prefix: str = CHECKPOINT_BLOB_PREFIX,
         checkpoint_write_prefix: str = CHECKPOINT_WRITE_PREFIX,
     ) -> Iterator[RedisSaver]:
         """Create a new RedisSaver instance."""
@@ -1144,7 +1139,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
                 connection_args=connection_args,
                 ttl=ttl,
                 checkpoint_prefix=checkpoint_prefix,
-                checkpoint_blob_prefix=checkpoint_blob_prefix,
                 checkpoint_write_prefix=checkpoint_write_prefix,
             )
 
@@ -1619,24 +1613,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             latest_pointer_key = f"checkpoint_latest:{storage_safe_thread_id}:{to_storage_safe_str(checkpoint_ns)}"
             keys_to_delete.append(latest_pointer_key)
 
-        # Delete all blobs for this thread
-        blob_query = FilterQuery(
-            filter_expression=Tag("thread_id") == storage_safe_thread_id,
-            return_fields=["checkpoint_ns", "channel", "version"],
-            num_results=10000,
-        )
-
-        blob_results = self.checkpoint_blobs_index.search(blob_query)
-
-        for doc in blob_results.docs:
-            checkpoint_ns = getattr(doc, "checkpoint_ns", "")
-            channel = getattr(doc, "channel", "")
-            version = getattr(doc, "version", "")
-
-            blob_key = self._make_redis_checkpoint_blob_key(
-                storage_safe_thread_id, checkpoint_ns, channel, version
-            )
-            keys_to_delete.append(blob_key)
+        # Channel values are stored inline — no separate blob keys to clean up.
 
         # Delete all writes for this thread
         writes_query = FilterQuery(
@@ -1691,35 +1668,39 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         self,
         thread_ids: Sequence[str],
         *,
-        keep_last: int = 1,
+        strategy: str = "keep_latest",
+        keep_last: Optional[int] = None,
         max_results: int = 10000,
     ) -> None:
         """Prune old checkpoints for the given threads per namespace.
 
-        Retains the ``keep_last`` most-recent checkpoints **per checkpoint
-        namespace** and removes the rest, along with their associated write
-        keys and key-registry sorted sets.
+        Retains the most-recent checkpoints **per checkpoint namespace** and
+        removes the rest, along with their associated write keys and
+        key-registry sorted sets.
 
         Each namespace (root ``""`` and any subgraph namespaces) is treated as
-        an independent checkpoint chain, so ``keep_last`` is applied separately
-        within each namespace.  Checkpoint blobs are intentionally *not* deleted
-        because blob keys are shared across checkpoints via channel versioning —
-        the same blob version may be referenced by both kept and evicted
-        checkpoints.
+        an independent checkpoint chain.  Channel values are stored inline
+        within each checkpoint document, so they are automatically removed
+        when the checkpoint document is deleted.
 
         Args:
             thread_ids: Thread IDs whose old checkpoints should be pruned.
-            keep_last: Number of recent checkpoints to retain per namespace.
-                Use ``keep_last=1`` to keep only the latest checkpoint (default).
-                Use ``keep_last=0`` to remove all checkpoints for the thread.
-                For multi-tool interrupt chains, ``max(10, n_tool_calls * 3 + 5)``
-                is a safe heuristic.
+            strategy: Pruning strategy.  ``"keep_latest"`` retains only the
+                most recent checkpoint per namespace (default).  ``"delete"``
+                removes all checkpoints for the thread.
+            keep_last: Optional override — number of recent checkpoints to
+                retain per namespace.  When provided, takes precedence over
+                ``strategy``.  Use ``keep_last=0`` to remove all checkpoints.
             max_results: Maximum number of checkpoints fetched from the index
-                per thread in a single query.  Threads with more checkpoints
-                than this limit will only have the first ``max_results`` entries
-                considered for pruning.  Raise this value for very long-lived
-                threads.  Defaults to 10 000.
+                per thread in a single query.  Defaults to 10 000.
         """
+        # Resolve keep_last from strategy if not explicitly provided
+        if keep_last is None:
+            if strategy == "delete":
+                keep_last = 0
+            else:
+                keep_last = 1
+
         # Validate input
         if not thread_ids:
             raise ValueError("``thread_ids`` must be a non-empty sequence")
@@ -1727,8 +1708,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             raise ValueError(f"``keep_last`` must be >= 0, got {keep_last}")
         if max_results < 1:
             raise ValueError(f"``max_results`` must be >= 1, got {max_results}")
-        
-        
+
         for thread_id in thread_ids:
             storage_safe_thread_id = to_storage_safe_id(thread_id)
 
@@ -1764,9 +1744,9 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
                 )
                 ns_evicted = ns_sorted[keep_last:]
                 to_evict.extend(ns_evicted)
-                if len(ns_evicted) == len(ns_docs): # nothing left in this namespace
+                if len(ns_evicted) == len(ns_docs):  # nothing left in this namespace
                     fully_evicted_ns.add(ns)
-                    
+
             if not to_evict:
                 continue
 
@@ -1818,7 +1798,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
                 keys_to_delete.append(
                     f"checkpoint_latest:{storage_safe_thread_id}:{ns}"
                 )
-            
+
             if self.cluster_mode:
                 for key in keys_to_delete:
                     self._redis.delete(key)

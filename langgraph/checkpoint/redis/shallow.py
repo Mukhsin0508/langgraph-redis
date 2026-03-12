@@ -27,7 +27,6 @@ from redisvl.redis.connection import RedisConnectionFactory
 from ulid import ULID
 
 from langgraph.checkpoint.redis.base import (
-    CHECKPOINT_BLOB_PREFIX,
     CHECKPOINT_PREFIX,
     CHECKPOINT_WRITE_PREFIX,
     REDIS_KEY_SEPARATOR,
@@ -47,7 +46,11 @@ logger = logging.getLogger(__name__)
 
 
 class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
-    """Redis implementation that only stores the most recent checkpoint."""
+    """Redis implementation that only stores the most recent checkpoint.
+
+    Supports standard Redis URLs (redis://), SSL (rediss://), and
+    Sentinel URLs (redis+sentinel://host:26379/service_name/db).
+    """
 
     # Default cache size limits
     DEFAULT_KEY_CACHE_MAX_SIZE = 1000
@@ -63,7 +66,6 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
         key_cache_max_size: Optional[int] = None,
         channel_cache_max_size: Optional[int] = None,
         checkpoint_prefix: str = CHECKPOINT_PREFIX,
-        checkpoint_blob_prefix: str = CHECKPOINT_BLOB_PREFIX,
         checkpoint_write_prefix: str = CHECKPOINT_WRITE_PREFIX,
     ) -> None:
         super().__init__(
@@ -72,7 +74,6 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
             connection_args=connection_args,
             ttl=ttl,
             checkpoint_prefix=checkpoint_prefix,
-            checkpoint_blob_prefix=checkpoint_blob_prefix,
             checkpoint_write_prefix=checkpoint_write_prefix,
         )
 
@@ -100,7 +101,6 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
         key_cache_max_size: Optional[int] = None,
         channel_cache_max_size: Optional[int] = None,
         checkpoint_prefix: str = CHECKPOINT_PREFIX,
-        checkpoint_blob_prefix: str = CHECKPOINT_BLOB_PREFIX,
         checkpoint_write_prefix: str = CHECKPOINT_WRITE_PREFIX,
     ) -> Iterator[ShallowRedisSaver]:
         """Create a new ShallowRedisSaver instance."""
@@ -114,7 +114,6 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
                 key_cache_max_size=key_cache_max_size,
                 channel_cache_max_size=channel_cache_max_size,
                 checkpoint_prefix=checkpoint_prefix,
-                checkpoint_blob_prefix=checkpoint_blob_prefix,
                 checkpoint_write_prefix=checkpoint_write_prefix,
             )
             yield saver
@@ -429,19 +428,13 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
         self.checkpoints_index = SearchIndex.from_dict(
             self.checkpoints_schema, redis_client=self._redis
         )
-        # Shallow implementation doesn't use blobs, but base class requires the attribute
-        self.checkpoint_blobs_index = SearchIndex.from_dict(
-            self.blobs_schema, redis_client=self._redis
-        )
         self.checkpoint_writes_index = SearchIndex.from_dict(
             self.writes_schema, redis_client=self._redis
         )
 
     def setup(self) -> None:
-        """Initialize the indices in Redis (skip blob index for shallow implementation)."""
-        # Create only the indexes we actually use
+        """Initialize the indices in Redis."""
         self.checkpoints_index.create(overwrite=False)
-        # Skip creating blob index since shallow doesn't use separate blobs
         self.checkpoint_writes_index.create(overwrite=False)
 
     def put_writes(
@@ -708,40 +701,6 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
             + ":*"
         )
 
-    @staticmethod
-    def _make_shallow_redis_checkpoint_blob_key_pattern(
-        thread_id: str, checkpoint_ns: str
-    ) -> str:
-        """Create a pattern to match all blob keys for a thread and namespace."""
-        return (
-            REDIS_KEY_SEPARATOR.join(
-                [
-                    CHECKPOINT_BLOB_PREFIX,
-                    str(to_storage_safe_id(thread_id)),
-                    to_storage_safe_str(checkpoint_ns),
-                ]
-            )
-            + ":*"
-        )
-
-    def _make_shallow_redis_checkpoint_blob_key_cached(
-        self, thread_id: str, checkpoint_ns: str, channel: str, version: str
-    ) -> str:
-        """Create a cached key for checkpoint blobs."""
-        cache_key = f"shallow_blob:{thread_id}:{checkpoint_ns}:{channel}:{version}"
-        if cache_key in self._key_cache:
-            # Move to end for LRU (most recently used)
-            self._key_cache.move_to_end(cache_key)
-        else:
-            # Add new entry, evicting oldest if necessary
-            if len(self._key_cache) >= self._key_cache_max_size:
-                # Remove least recently used (first item)
-                self._key_cache.popitem(last=False)
-            self._key_cache[cache_key] = self._make_redis_checkpoint_blob_key(
-                thread_id, checkpoint_ns, channel, version
-            )
-        return self._key_cache[cache_key]
-
     def delete_thread(self, thread_id: str) -> None:
         """Delete all checkpoints and writes associated with a specific thread ID.
 
@@ -769,8 +728,8 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
         # need the storage-safe form that was used when those keys were originally written.
         checkpoint_data = []
         for doc in checkpoint_results.docs:
-            safe_ns = getattr(doc, "checkpoint_ns", "") # storage-safe: for f-strings
-            raw_ns = from_storage_safe_str(safe_ns) # raw: for key builder method
+            safe_ns = getattr(doc, "checkpoint_ns", "")  # storage-safe: for f-strings
+            raw_ns = from_storage_safe_str(safe_ns)  # raw: for key builder method
             checkpoint_id = getattr(doc, "checkpoint_id", "")
             checkpoint_data.append((raw_ns, safe_ns, checkpoint_id))
 
@@ -814,27 +773,37 @@ class ShallowRedisSaver(BaseRedisSaver[Redis, SearchIndex]):
         self,
         thread_ids: Sequence[str],
         *,
-        keep_last: int = 1,
+        strategy: str = "keep_latest",
+        keep_last: Optional[int] = None,
     ) -> None:
         """Prune checkpoints for the given threads.
 
         ``ShallowRedisSaver`` stores at most one checkpoint per namespace by
-        design, so ``keep_last >= 1`` is always a no-op.  ``keep_last=0``
-        removes all checkpoints for each thread (equivalent to
-        ``delete_thread``).
+        design, so ``strategy="keep_latest"`` (or ``keep_last >= 1``) is
+        always a no-op.  ``strategy="delete"`` (or ``keep_last=0``) removes
+        all checkpoints for each thread (equivalent to ``delete_thread``).
 
         Args:
             thread_ids: Thread IDs to prune.
-            keep_last: Checkpoints to retain per namespace.  Any value >= 1
-                is a no-op for shallow savers.  Pass ``0`` to delete all.
+            strategy: Pruning strategy.  ``"keep_latest"`` is a no-op for
+                shallow savers (default).  ``"delete"`` removes all.
+            keep_last: Optional override.  Any value >= 1 is a no-op.
+                Pass ``0`` to delete all.
         """
-        # Validate input 
+        # Resolve keep_last from strategy if not explicitly provided
+        if keep_last is None:
+            if strategy == "delete":
+                keep_last = 0
+            else:
+                keep_last = 1
+
+        # Validate input
         if not thread_ids:
-            raise ValueError(f"``thread_ids`` must be a non-empty sequence")
-        
+            raise ValueError("``thread_ids`` must be a non-empty sequence")
+
         if keep_last < 0:
             raise ValueError(f"``keep_last`` must be >= 0, got {keep_last}")
-        
+
         if keep_last >= 1:
             return
         for thread_id in thread_ids:
